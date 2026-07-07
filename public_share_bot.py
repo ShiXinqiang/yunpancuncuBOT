@@ -587,6 +587,8 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     user = update.effective_user
     context.user_data['is_processing'] = True 
+    # 初始化/增加活跃任务计数
+    context.user_data['running_jobs'] = context.user_data.get('running_jobs', 0) + 1
     
     media_group_id = update.message.media_group_id
     if media_group_id:
@@ -598,8 +600,11 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             try: await update.message.reply_text("收到相册，正在处理... 全部发完请点完成。", quote=True)
             except: pass
         
+        # 如果相册内有新图片进来，取消上一个定时器，重新计时（防抖）
         for job in context.job_queue.get_jobs_by_name(job_name): 
             job.schedule_removal()
+            # 既然上一个 Job 被取消了，计数器要减 1
+            context.user_data['running_jobs'] = max(0, context.user_data['running_jobs'] - 1)
         
         context.job_queue.run_once(
             process_and_collect_files_job, 
