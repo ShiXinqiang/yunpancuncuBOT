@@ -567,16 +567,22 @@ async def process_and_collect_files_job(context: ContextTypes.DEFAULT_TYPE) -> N
             
         user_data['session_message_ids'].extend(forwarded_ids)
         user_data['session_file_count'] += len(forwarded_ids)
-        user_data['is_processing'] = False 
         
     except Exception as e:
         logger.error(f"处理文件Job失败: {e}")
-        if user_id in context.application.user_data:
-            context.application.user_data[user_id]['is_processing'] = False
     finally:
+        # 无论成功失败，活跃任务计数 -1
+        if user_id in context.application.user_data:
+            u_data = context.application.user_data[user_id]
+            if 'running_jobs' in u_data:
+                u_data['running_jobs'] = max(0, u_data['running_jobs'] - 1)
+            if u_data.get('running_jobs', 0) == 0:
+                u_data['is_processing'] = False
+
         media_group_id = job.name
         if media_group_id and media_group_id in context.bot_data: 
             del context.bot_data[media_group_id]
+
 
 @require_group_membership
 async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
