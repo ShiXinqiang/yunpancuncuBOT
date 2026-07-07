@@ -155,7 +155,7 @@ def require_group_membership(func):
         if await is_user_in_group(user_id, context):
             return await func(update, context, *args, **kwargs)
         else:
-            BOT_START_LINK = "t.me/jisou?start=a_8438438776" #https://t.me/sogoaibot?start=8438438776
+            BOT_START_LINK = "t.me/jisou?start=a_8438438776"
             if update.callback_query:
                 try:
                     await update.callback_query.answer("⚠️ 请先加入官方群组。", show_alert=True)
@@ -214,7 +214,6 @@ def create_pagination_keyboard(current_page: int, total_pages: int, callback_pre
 # --- 分页显示分享文件 ---
 async def show_shared_files_page(update: Update, context: ContextTypes.DEFAULT_TYPE, share_id: str, page: int = 1):
     try:
-        # ★ 改为异步 DB 查询
         result = await execute_db(
             "SELECT message_id, file_caption FROM files WHERE share_id = %s", 
             (share_id,), 
@@ -297,7 +296,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context.user_data['pending_share_id'] = target_share_id
             bot_username = context.bot_data.get('bot_username', '')
             retry_url = f"https://t.me/{bot_username}?start={target_share_id}"
-            EXTERNAL_BOT_LINK = "t.me/jisou?start=a_849529159" #https://t.me/sogoaibot?start=8438438776
+            EXTERNAL_BOT_LINK = "t.me/jisou?start=a_849529159"
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🚀 启动机器人", url=EXTERNAL_BOT_LINK)],      
                 [InlineKeyboardButton("👉 点击这里加入群组", url=GROUP_INVITE_LINK)], 
@@ -338,7 +337,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def show_my_files_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
     user_id = update.effective_user.id
     try:
-        # ★ 改为异步 DB 查询
         count_res = await execute_db("SELECT COUNT(*) FROM files WHERE uploader_id = %s", (user_id,), fetch_one=True)
         total_files = count_res[0]
 
@@ -352,7 +350,6 @@ async def show_my_files_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
         page = max(1, min(page, total_pages))
         offset = (page - 1) * FILES_PER_PAGE
         
-        # ★ 改为异步 DB 查询
         files_on_page = await execute_db(
             "SELECT share_id, file_caption FROM files WHERE uploader_id = %s ORDER BY timestamp DESC LIMIT %s OFFSET %s",
             (user_id, FILES_PER_PAGE, offset),
@@ -395,7 +392,6 @@ async def my_files_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     
-    # ★ 修复：捕获 Query is too old 错误
     try:
         await query.answer()
     except BadRequest as e:
@@ -432,13 +428,12 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         user_id = query.from_user.id
         
         try:
-            # ★ 改为异步 DB 查询
             result = await execute_db("SELECT uploader_id, message_id FROM files WHERE share_id = %s", (share_id,), fetch_one=True)
 
             if not result:
                 try: await query.message.reply_text("🤔 文件好像已经被删除了。")
                 except: pass
-                await show_my_files_page(update, context, page=current_page) # 刷新
+                await show_my_files_page(update, context, page=current_page) 
                 return
 
             uploader_id, message_ids_str = result
@@ -447,7 +442,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                 except: pass
                 return
 
-            # ★ 改为异步 DB 删除
             await execute_db("DELETE FROM files WHERE share_id = %s", (share_id,), commit=True)
             
             # 删除后刷新页面
@@ -485,7 +479,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     keyboard = ReplyKeyboardMarkup([[KeyboardButton(text=FINISH_UPLOAD_BUTTON_TEXT)]], resize_keyboard=True, one_time_keyboard=False)
     await update.message.reply_text("好的，请发送文件或相册。\n发送完毕后，点击“完成上传”生成链接。", reply_markup=keyboard)
 
-async def finish_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+
+# ============================================================================
+# ★★★ 修改 1：精准等待所有任务清零，防止由于并发导致逻辑打架 ★★★
+# ============================================================================
 async def finish_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user: return
     if update.effective_chat.type != ChatType.PRIVATE: return
@@ -545,6 +542,7 @@ async def finish_upload_handler(update: Update, context: ContextTypes.DEFAULT_TY
     keyboard = ReplyKeyboardMarkup([[KeyboardButton(text=UPLOAD_BUTTON_TEXT)]], resize_keyboard=True, one_time_keyboard=False)
     await update.message.reply_text("会话结束。再次点击按钮开始新上传。", reply_markup=keyboard)
 
+
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user: return
     if update.effective_chat.type != ChatType.PRIVATE:
@@ -553,6 +551,10 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     context.user_data.clear()
     await finish_upload_handler(update, context)
 
+
+# ============================================================================
+# ★★★ 修改 2：任务完成时安全地将 active job 计数器减 1 ★★★
+# ============================================================================
 async def process_and_collect_files_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     job = context.job
     user_id, chat_id, message_ids = job.data
@@ -586,6 +588,9 @@ async def process_and_collect_files_job(context: ContextTypes.DEFAULT_TYPE) -> N
             del context.bot_data[media_group_id]
 
 
+# ============================================================================
+# ★★★ 修改 3：触发上传或相册聚合时，增加 active job 计数器 ★★★
+# ============================================================================
 @require_group_membership
 async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != ChatType.PRIVATE: return
@@ -611,8 +616,8 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # 如果相册内有新图片进来，取消上一个定时器，重新计时（防抖）
         for job in context.job_queue.get_jobs_by_name(job_name): 
             job.schedule_removal()
-            # 既然上一个 Job 被取消了，计数器要减 1
-            context.user_data['running_jobs'] = max(0, context.user_data['running_jobs'] - 1)
+            # 取消上一个 Job，因此计数器回滚减 1
+            context.user_data['running_jobs'] = max(0, context.user_data.get('running_jobs', 0) - 1)
         
         context.job_queue.run_once(
             process_and_collect_files_job, 
@@ -645,17 +650,15 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         await update.message.reply_text("请点击 '📤 上传文件' 按钮开始。")
 
-# --- ★★★ 必须添加：初始化后回调 ★★★ ---
+# --- 初始化后回调 ---
 async def post_init(application: Application) -> None:
     bot_info = await application.bot.get_me()
     application.bot_data['bot_username'] = bot_info.username
     logger.info(f"机器人 {bot_info.username} 已成功初始化。")
 
 def main() -> None:
-    # 1. 数据库建表
     setup_database()
 
-    # 2. ★ 优化网络请求 (去除报错参数，强制 HTTP 1.1)
     trequest = HTTPXRequest(
         connection_pool_size=20,
         read_timeout=60.0,
@@ -665,7 +668,6 @@ def main() -> None:
         http_version="1.1", 
     )
 
-    # 3. 构建应用
     builder = Application.builder().token(BOT_TOKEN).post_init(post_init).request(trequest)
     
     if PROXY_URL:
@@ -686,7 +688,7 @@ def main() -> None:
     
     logger.info(">>> 机器人正在启动... <<<")
     
-    # ★ 启动时丢弃积压更新，防止死锁
+    # 启动时丢弃积压更新，防止死锁
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
