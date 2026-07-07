@@ -486,14 +486,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text("好的，请发送文件或相册。\n发送完毕后，点击“完成上传”生成链接。", reply_markup=keyboard)
 
 async def finish_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def finish_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user: return
     if update.effective_chat.type != ChatType.PRIVATE: return
     
-    # 等待后台处理
+    # 精准等待后台所有 Job 释放
     wait_count = 0
-    if context.user_data.get('is_processing'):
+    if context.user_data.get('is_processing') or context.user_data.get('running_jobs', 0) > 0:
         wait_msg = await update.message.reply_text("⏳ 正在处理接收到的文件，请稍候...")
-        while context.user_data.get('is_processing') and wait_count < 20:
+        while (context.user_data.get('is_processing') or context.user_data.get('running_jobs', 0) > 0) and wait_count < 30:
             await asyncio.sleep(0.5)
             wait_count += 1
         try: await wait_msg.delete()
@@ -505,7 +506,10 @@ async def finish_upload_handler(update: Update, context: ContextTypes.DEFAULT_TY
     
     session_message_ids = context.user_data.pop('session_message_ids', [])
     total_files = context.user_data.pop('session_file_count', 0)
+    
+    # 清理状态防止残留
     context.user_data['is_processing'] = False
+    context.user_data['running_jobs'] = 0
 
     if session_message_ids:
         try:
@@ -516,7 +520,6 @@ async def finish_upload_handler(update: Update, context: ContextTypes.DEFAULT_TY
             caption = f"批量上传 (共 {total_files} 个文件)"
             file_type = "合集"
             
-            # ★ 改为异步 DB 插入
             await execute_db(
                 "INSERT INTO files (share_id, message_id, uploader_id, file_caption, file_type) VALUES (%s, %s, %s, %s, %s)",
                 (share_id, ids_str, user_id, caption, file_type),
@@ -526,7 +529,6 @@ async def finish_upload_handler(update: Update, context: ContextTypes.DEFAULT_TY
             user_message = (f"🎉 **上传完成！**\n\n文件数: {total_files}\n🔗 **分享链接：**\n`{final_link}`")
             await processing_message.edit_text(text=user_message, parse_mode="Markdown", disable_web_page_preview=True)
             
-            # 日志
             escaped_link = escape_markdown_v2(final_link)
             escaped_name = escape_markdown_v2(user.full_name)
             log_msg = f"*New Upload*\nUser: {escaped_name}\nFiles: {total_files}\nLink: {escaped_link}"
