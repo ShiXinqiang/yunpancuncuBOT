@@ -4,7 +4,9 @@ import secrets
 import re
 import asyncio
 import functools
-from typing import Dict, List, Optional
+import html
+from urllib.parse import urlparse
+from typing import List, Optional, Tuple
 from dotenv import load_dotenv
 
 import psycopg2
@@ -34,6 +36,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 REQUIRED_GROUP_ID = os.getenv("REQUIRED_GROUP_ID")
 GROUP_INVITE_LINK = os.getenv("GROUP_INVITE_LINK")
 PROXY_URL = os.getenv("PROXY_URL")
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
 
 # --- 日志记录配置 ---
 logging.basicConfig(
@@ -45,6 +48,28 @@ logger = logging.getLogger(__name__)
 UPLOAD_BUTTON_TEXT = "📤 上传文件"
 FINISH_UPLOAD_BUTTON_TEXT = "✅ 完成上传"
 FILES_PER_PAGE = 10
+MAX_AD_TEXT_LENGTH = 800
+AD_SLOTS = {
+    "home": "首页欢迎页",
+    "file_view": "文件查看页",
+    "upload_done": "上传完成页",
+}
+
+
+def parse_admin_ids(raw_value: str) -> set[int]:
+    """解析英文逗号分隔的 Telegram 用户 ID。"""
+    admin_ids = set()
+    for value in raw_value.split(","):
+        value = value.strip()
+        if not value:
+            continue
+        if not value.isdigit():
+            raise ValueError(f"ADMIN_IDS 中包含无效 Telegram 用户 ID: {value}")
+        admin_ids.add(int(value))
+    return admin_ids
+
+
+ADMIN_IDS = parse_admin_ids(ADMIN_IDS_RAW)
 
 # --- 适配数据库 SSL 连接 ---
 if DATABASE_URL and 'sslmode' not in DATABASE_URL and 'localhost' not in DATABASE_URL:
@@ -53,22 +78,35 @@ if DATABASE_URL and 'sslmode' not in DATABASE_URL and 'localhost' not in DATABAS
     else:
         DATABASE_URL += '?sslmode=require'
 
-# --- 检查所有必要的环境变量 ---
-if not all([BOT_TOKEN, PRIVATE_CHANNEL_ID, DATABASE_URL, REQUIRED_GROUP_ID, GROUP_INVITE_LINK]):
-    raise ValueError("错误：请确保所有必需的环境变量都已设置。")
+db_pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
 
-# --- 数据库连接池 ---
-try:
-    # 增加连接池大小，防止高并发下连接耗尽
-    db_pool = psycopg2.pool.SimpleConnectionPool(
-        1, 20,
-        dsn=DATABASE_URL,
-        connect_timeout=10
-    )
-    logger.info("数据库连接池初始化成功。")
-except psycopg2.OperationalError as e:
-    logger.error(f"无法连接到数据库: {e}")
-    raise e
+
+def validate_config() -> None:
+    required = {
+        "BOT_TOKEN": BOT_TOKEN,
+        "PRIVATE_CHANNEL_ID": PRIVATE_CHANNEL_ID,
+        "DATABASE_URL": DATABASE_URL,
+        "REQUIRED_GROUP_ID": REQUIRED_GROUP_ID,
+        "GROUP_INVITE_LINK": GROUP_INVITE_LINK,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise ValueError(f"缺少必需的环境变量: {', '.join(missing)}")
+
+
+def init_database_pool() -> None:
+    global db_pool
+    try:
+        # execute_db 会在线程池中运行，必须使用线程安全的连接池。
+        db_pool = psycopg2.pool.ThreadedConnectionPool(
+            1, 20,
+            dsn=DATABASE_URL,
+            connect_timeout=10,
+        )
+        logger.info("数据库连接池初始化成功。")
+    except psycopg2.OperationalError as e:
+        logger.error(f"无法连接到数据库: {e}")
+        raise
 
 # ============================================================================
 # ★★★ 核心修复：异步数据库操作包装器 ★★★
@@ -76,22 +114,22 @@ except psycopg2.OperationalError as e:
 # ============================================================================
 async def execute_db(query, params=None, fetch_one=False, fetch_all=False, commit=False):
     def _run():
+        if db_pool is None:
+            raise RuntimeError("数据库连接池尚未初始化。")
         conn = None
         res = None
         try:
             conn = db_pool.getconn()
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            
-            if fetch_one:
-                res = cursor.fetchone()
-            elif fetch_all:
-                res = cursor.fetchall()
-            
-            if commit:
-                conn.commit()
-            
-            cursor.close()
+            with conn.cursor() as cursor:
+                cursor.execute(query, params)
+
+                if fetch_one:
+                    res = cursor.fetchone()
+                elif fetch_all:
+                    res = cursor.fetchall()
+
+                if commit:
+                    conn.commit()
             return res
         except Exception as e:
             logger.error(f"DB Error: {e}")
@@ -104,6 +142,8 @@ async def execute_db(query, params=None, fetch_one=False, fetch_all=False, commi
 
 # --- 数据库初始化函数 ---
 def setup_database():
+    if db_pool is None:
+        raise RuntimeError("数据库连接池尚未初始化。")
     conn = None
     try:
         conn = db_pool.getconn()
@@ -114,6 +154,22 @@ def setup_database():
                 uploader_id BIGINT NOT NULL, timestamp TIMESTAMPTZ DEFAULT NOW()
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ad_slots (
+                slot VARCHAR(32) PRIMARY KEY,
+                enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                ad_text TEXT NOT NULL DEFAULT '',
+                button_text VARCHAR(64) NOT NULL DEFAULT '查看详情',
+                button_url TEXT NOT NULL DEFAULT '',
+                updated_by BIGINT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        ''')
+        for slot in AD_SLOTS:
+            cursor.execute(
+                "INSERT INTO ad_slots (slot) VALUES (%s) ON CONFLICT (slot) DO NOTHING",
+                (slot,)
+            )
         # 检查并添加字段
         cursor.execute("SELECT 1 FROM information_schema.columns WHERE table_name='files' AND column_name='file_caption'")
         if cursor.fetchone() is None:
@@ -133,8 +189,43 @@ def setup_database():
     except Exception as e:
         logger.error(f"数据库初始化失败: {e}")
         if conn: conn.rollback()
+        raise
     finally:
         if conn: db_pool.putconn(conn)
+
+
+def is_admin(user_id: Optional[int]) -> bool:
+    return bool(user_id and user_id in ADMIN_IDS)
+
+
+def is_valid_ad_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        return parsed.scheme in {"http", "https", "tg"} and bool(parsed.netloc or parsed.scheme == "tg")
+    except ValueError:
+        return False
+
+
+async def get_ad(slot: str) -> Optional[Tuple[str, str, str]]:
+    result = await execute_db(
+        "SELECT ad_text, button_text, button_url FROM ad_slots WHERE slot = %s AND enabled = TRUE",
+        (slot,),
+        fetch_one=True,
+    )
+    if not result or not result[0].strip():
+        return None
+    return result
+
+
+def format_ad_html(ad: Optional[Tuple[str, str, str]]) -> str:
+    if not ad:
+        return ""
+    ad_text, button_text, button_url = ad
+    block = f"\n\n📢 <b>广告</b>\n{html.escape(ad_text)}"
+    if button_url:
+        label = html.escape(button_text or "查看详情")
+        block += f'\n<a href="{html.escape(button_url, quote=True)}">🔗 {label}</a>'
+    return block
 
 # --- 检查用户是否在指定群组 ---
 async def is_user_in_group(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -246,22 +337,22 @@ async def show_shared_files_page(update: Update, context: ContextTypes.DEFAULT_T
         await asyncio.sleep(0.5)
 
         keyboard = create_pagination_keyboard(page, total_pages, "spage", share_id)
+        ad = await get_ad("file_view")
+        if ad and ad[2]:
+            keyboard.append([InlineKeyboardButton(ad[1] or "查看详情", url=ad[2])])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        AD_TEXT = "看片资源免费无限搜索" 
-        AD_LINK = "https://t.me/xbso1?start=a_8438438776" 
-
         text = (
-            f"▶️ **正在查看:** {file_caption}\n"
-            f"💎广告:  [{AD_TEXT}]({AD_LINK})\n"
-            f"📑 第 {page} 页 / 共 {total_pages} 页 (总计 {total_files} 个文件)"
+            f"▶️ <b>正在查看：</b>{html.escape(file_caption)}\n"
+            f"📑 第 {page} 页 / 共 {total_pages} 页（总计 {total_files} 个文件）"
         )
+        if ad:
+            text += f"\n\n📢 <b>广告</b>\n{html.escape(ad[0])}"
         
         new_panel = await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=text,
             reply_markup=reply_markup,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             disable_web_page_preview=True
         )
         context.user_data['last_control_panel_id'] = new_panel.message_id
@@ -274,11 +365,12 @@ async def show_shared_files_page(update: Update, context: ContextTypes.DEFAULT_T
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user: return
     user = update.effective_user
+    pending_share_id = context.user_data.get('pending_share_id')
     context.user_data.clear()
     
     target_share_id = context.args[0] if context.args else None
     if not target_share_id:
-        target_share_id = context.user_data.get('pending_share_id')
+        target_share_id = pending_share_id
     
     if update.effective_chat.type != ChatType.PRIVATE and target_share_id:
         bot_username = context.bot_data.get('bot_username', '')
@@ -313,7 +405,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         context.user_data['state'] = 'default'
         keyboard = ReplyKeyboardMarkup([[KeyboardButton(text=UPLOAD_BUTTON_TEXT)]], resize_keyboard=True, one_time_keyboard=False)
-        await update.message.reply_text("欢迎使用文件分享机器人！点击下方按钮上传文件或相册。\n\n使用 /help 查看更多指令。", reply_markup=keyboard)
+        ad = await get_ad("home")
+        welcome_text = "👋 <b>欢迎使用文件分享机器人！</b>\n\n点击下方按钮上传文件或相册。\n使用 /help 查看更多指令。"
+        await update.message.reply_text(
+            welcome_text + format_ad_html(ad),
+            reply_markup=keyboard,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
 
 # --- /help 命令 ---
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -332,6 +431,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "⚠️ <b>使用条件:</b>\n"
         "为防止滥用，您必须先加入我们的官方群组才能使用机器人。"
     )
+    if is_admin(update.effective_user.id):
+        help_text += "\n\n<b>管理员</b>\n▪️ 使用 /ads 管理所有广告位。\n▪️ 使用 /adcancel 取消正在进行的广告编辑。"
     await update.message.reply_text(help_text, parse_mode="HTML")
 
 # --- /myfiles 分页 ---
@@ -391,10 +492,185 @@ async def my_files_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     await show_my_files_page(update, context, page=1)
 
+
+# --- 广告管理（仅 ADMIN_IDS 中的用户可用） ---
+async def show_ads_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    rows = await execute_db(
+        "SELECT slot, enabled, ad_text FROM ad_slots ORDER BY slot",
+        fetch_all=True,
+    )
+    current = {slot: (enabled, ad_text) for slot, enabled, ad_text in rows}
+    keyboard = []
+    for slot, display_name in AD_SLOTS.items():
+        enabled, ad_text = current.get(slot, (False, ""))
+        status = "🟢" if enabled and ad_text.strip() else "⚪"
+        keyboard.append([InlineKeyboardButton(
+            f"{status} {display_name}", callback_data=f"ad:slot:{slot}"
+        )])
+    text = (
+        "📣 <b>广告位管理</b>\n\n"
+        "选择广告位进行编辑。🟢 表示已启用；没有广告文案时，即使启用也不会展示。"
+    )
+    markup = InlineKeyboardMarkup(keyboard)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    else:
+        await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def show_ad_slot_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, slot: str) -> None:
+    if slot not in AD_SLOTS:
+        return
+    row = await execute_db(
+        "SELECT enabled, ad_text, button_text, button_url, updated_at FROM ad_slots WHERE slot = %s",
+        (slot,),
+        fetch_one=True,
+    )
+    enabled, ad_text, button_text, button_url, updated_at = row
+    status = "🟢 已启用" if enabled else "⚪ 已停用"
+    preview = html.escape(ad_text) if ad_text else "<i>未设置</i>"
+    url_preview = html.escape(button_url) if button_url else "<i>未设置</i>"
+    text = (
+        f"📍 <b>{AD_SLOTS[slot]}</b>\n"
+        f"状态：{status}\n\n"
+        f"<b>广告文案</b>\n{preview}\n\n"
+        f"<b>按钮文字</b>：{html.escape(button_text or '查看详情')}\n"
+        f"<b>跳转链接</b>：{url_preview}\n\n"
+        f"最后更新：{updated_at:%Y-%m-%d %H:%M:%S %Z}"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏯ 启用 / 停用", callback_data=f"ad:toggle:{slot}")],
+        [
+            InlineKeyboardButton("✏️ 修改文案", callback_data=f"ad:edit_text:{slot}"),
+            InlineKeyboardButton("🔗 修改链接", callback_data=f"ad:edit_url:{slot}"),
+        ],
+        [InlineKeyboardButton("🔘 修改按钮文字", callback_data=f"ad:edit_button:{slot}")],
+        [InlineKeyboardButton("🧹 清空广告位", callback_data=f"ad:clear:{slot}")],
+        [InlineKeyboardButton("‹ 返回广告位列表", callback_data="ad:list")],
+    ])
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=True)
+    else:
+        await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=True)
+
+
+async def ads_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id if update.effective_user else None):
+        await update.effective_message.reply_text("🚫 你没有广告管理权限。\n\n使用 /id 可查看自己的 Telegram 用户 ID。")
+        return
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.effective_message.reply_text("请在机器人私聊中管理广告。", quote=True)
+        return
+    context.user_data.pop("ad_edit", None)
+    await show_ads_panel(update, context)
+
+
+async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user:
+        await update.effective_message.reply_text(f"你的 Telegram 用户 ID：`{update.effective_user.id}`", parse_mode="Markdown")
+
+
+async def handle_ad_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, parts: List[str]) -> bool:
+    if not parts or parts[0] != "ad":
+        return False
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("你没有广告管理权限。", show_alert=True)
+        return True
+    try:
+        await query.answer()
+    except BadRequest:
+        pass
+
+    action = parts[1] if len(parts) > 1 else ""
+    slot = parts[2] if len(parts) > 2 else ""
+    if action == "list":
+        context.user_data.pop("ad_edit", None)
+        await show_ads_panel(update, context)
+    elif slot not in AD_SLOTS:
+        await query.answer("无效的广告位。", show_alert=True)
+    elif action == "slot":
+        context.user_data.pop("ad_edit", None)
+        await show_ad_slot_panel(update, context, slot)
+    elif action == "toggle":
+        await execute_db(
+            "UPDATE ad_slots SET enabled = NOT enabled, updated_by = %s, updated_at = NOW() WHERE slot = %s",
+            (query.from_user.id, slot),
+            commit=True,
+        )
+        await show_ad_slot_panel(update, context, slot)
+    elif action == "clear":
+        await execute_db(
+            "UPDATE ad_slots SET enabled = FALSE, ad_text = '', button_text = '查看详情', button_url = '', updated_by = %s, updated_at = NOW() WHERE slot = %s",
+            (query.from_user.id, slot),
+            commit=True,
+        )
+        context.user_data.pop("ad_edit", None)
+        await show_ad_slot_panel(update, context, slot)
+    elif action in {"edit_text", "edit_url", "edit_button"}:
+        field = action.removeprefix("edit_")
+        context.user_data["ad_edit"] = {"slot": slot, "field": field}
+        prompts = {
+            "text": f"请发送新的广告文案（最多 {MAX_AD_TEXT_LENGTH} 个字符）。",
+            "url": "请发送新的跳转链接（http、https 或 tg://），发送 none 可移除链接。",
+            "button": "请发送新的按钮文字（最多 32 个字符）。",
+        }
+        await query.message.reply_text(prompts[field] + "\n发送 /adcancel 可取消。")
+    return True
+
+
+async def process_ad_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    edit = context.user_data.get("ad_edit")
+    if not edit or not is_admin(update.effective_user.id if update.effective_user else None):
+        return False
+    value = update.message.text.strip()
+    slot, field = edit["slot"], edit["field"]
+    if field == "text":
+        if not value or len(value) > MAX_AD_TEXT_LENGTH:
+            await update.message.reply_text(f"文案必须为 1–{MAX_AD_TEXT_LENGTH} 个字符，请重新发送。")
+            return True
+        column, value_to_save = "ad_text", value
+    elif field == "url":
+        if value.lower() == "none":
+            value = ""
+        elif len(value) > 500 or not is_valid_ad_url(value):
+            await update.message.reply_text("链接无效。请发送 http、https 或 tg:// 开头的完整链接，或发送 none 移除。")
+            return True
+        column, value_to_save = "button_url", value
+    else:
+        if not value or len(value) > 32:
+            await update.message.reply_text("按钮文字必须为 1–32 个字符，请重新发送。")
+            return True
+        column, value_to_save = "button_text", value
+
+    # column 只来自上方固定白名单，不接受用户输入。
+    await execute_db(
+        f"UPDATE ad_slots SET {column} = %s, updated_by = %s, updated_at = NOW() WHERE slot = %s",
+        (value_to_save, update.effective_user.id, slot),
+        commit=True,
+    )
+    context.user_data.pop("ad_edit", None)
+    await update.message.reply_text("✅ 已保存。")
+    await show_ad_slot_panel(update, context, slot)
+    return True
+
+
+async def ad_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id if update.effective_user else None):
+        return
+    context.user_data.pop("ad_edit", None)
+    await update.effective_message.reply_text("已取消本次编辑。")
+    await show_ads_panel(update, context)
+
 # --- 按钮回调处理器 ---
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    
+
+    parts = query.data.split(":")
+    if parts[0] == "ad":
+        await handle_ad_callback(update, context, parts)
+        return
+
     # ★ 修复：捕获 Query is too old 错误
     try:
         await query.answer()
@@ -406,7 +682,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error(f"Callback unexpected error: {e}")
 
-    parts = query.data.split(":", 2)
     action = parts[0]
     
     # 清理旧消息
@@ -498,6 +773,9 @@ async def finish_upload_handler(update: Update, context: ContextTypes.DEFAULT_TY
             wait_count += 1
         try: await wait_msg.delete()
         except: pass
+        if context.user_data.get('is_processing'):
+            await update.message.reply_text("文件仍在处理中，请稍等几秒后再次点击“完成上传”。")
+            return
     
     processing_message = await update.message.reply_text("🔄 正在生成分享链接...")
     user = update.effective_user
@@ -523,8 +801,14 @@ async def finish_upload_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 commit=True
             )
             
-            user_message = (f"🎉 **上传完成！**\n\n文件数: {total_files}\n🔗 **分享链接：**\n`{final_link}`")
-            await processing_message.edit_text(text=user_message, parse_mode="Markdown", disable_web_page_preview=True)
+            ad = await get_ad("upload_done")
+            user_message = (
+                f"🎉 <b>上传完成！</b>\n\n"
+                f"文件数：{total_files}\n"
+                f"🔗 <b>分享链接：</b>\n<code>{html.escape(final_link)}</code>"
+                f"{format_ad_html(ad)}"
+            )
+            await processing_message.edit_text(text=user_message, parse_mode="HTML", disable_web_page_preview=True)
             
             # 日志
             escaped_link = escape_markdown_v2(final_link)
@@ -549,7 +833,9 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("请在私聊中使用。", quote=True)
         return
     context.user_data.clear()
-    await finish_upload_handler(update, context)
+    context.user_data['state'] = 'default'
+    keyboard = ReplyKeyboardMarkup([[KeyboardButton(text=UPLOAD_BUTTON_TEXT)]], resize_keyboard=True, one_time_keyboard=False)
+    await update.message.reply_text("✅ 已取消当前上传。", reply_markup=keyboard)
 
 async def process_and_collect_files_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     job = context.job
@@ -567,13 +853,15 @@ async def process_and_collect_files_job(context: ContextTypes.DEFAULT_TYPE) -> N
             
         user_data['session_message_ids'].extend(forwarded_ids)
         user_data['session_file_count'] += len(forwarded_ids)
-        user_data['is_processing'] = False 
         
     except Exception as e:
         logger.error(f"处理文件Job失败: {e}")
-        if user_id in context.application.user_data:
-            context.application.user_data[user_id]['is_processing'] = False
     finally:
+        if user_id in context.application.user_data:
+            user_data = context.application.user_data[user_id]
+            pending_jobs = max(0, user_data.get('pending_file_jobs', 1) - 1)
+            user_data['pending_file_jobs'] = pending_jobs
+            user_data['is_processing'] = pending_jobs > 0
         media_group_id = job.name
         if media_group_id and media_group_id in context.bot_data: 
             del context.bot_data[media_group_id]
@@ -595,6 +883,7 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         is_first_in_group = not group_context.get('message_ids')
         group_context.setdefault('message_ids', []).append(update.message.message_id)
         if is_first_in_group:
+            context.user_data['pending_file_jobs'] = context.user_data.get('pending_file_jobs', 0) + 1
             try: await update.message.reply_text("收到相册，正在处理... 全部发完请点完成。", quote=True)
             except: pass
         
@@ -608,6 +897,7 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             name=job_name
         )
     else: 
+        context.user_data['pending_file_jobs'] = context.user_data.get('pending_file_jobs', 0) + 1
         try: await update.message.reply_text("收到文件...", quote=True)
         except: pass
         context.job_queue.run_once(
@@ -620,6 +910,8 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if update.effective_chat.type == ChatType.CHANNEL: return
     if not update.effective_user: return
     if update.effective_chat.type != ChatType.PRIVATE: return
+    if await process_ad_admin_input(update, context):
+        return
     bot_username = context.bot_data.get('bot_username', '')
     user_text = update.message.text
     pattern = re.compile(rf"https?://t\.me/{bot_username}\?start=([A-Za-z0-9_-]+)")
@@ -638,9 +930,23 @@ async def post_init(application: Application) -> None:
     application.bot_data['bot_username'] = bot_info.username
     logger.info(f"机器人 {bot_info.username} 已成功初始化。")
 
+
+async def post_shutdown(application: Application) -> None:
+    if db_pool is not None:
+        db_pool.closeall()
+        logger.info("数据库连接池已关闭。")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("处理 Telegram 更新时发生未捕获异常", exc_info=context.error)
+
 def main() -> None:
-    # 1. 数据库建表
+    # 1. 配置检查与数据库建表
+    validate_config()
+    init_database_pool()
     setup_database()
+    if not ADMIN_IDS:
+        logger.warning("未设置 ADMIN_IDS，广告管理面板将无人可以访问。")
 
     # 2. ★ 优化网络请求 (去除报错参数，强制 HTTP 1.1)
     trequest = HTTPXRequest(
@@ -653,7 +959,13 @@ def main() -> None:
     )
 
     # 3. 构建应用
-    builder = Application.builder().token(BOT_TOKEN).post_init(post_init).request(trequest)
+    builder = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .request(trequest)
+    )
     
     if PROXY_URL:
         builder.proxy_url(PROXY_URL)
@@ -665,11 +977,15 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("myfiles", my_files_command))
+    application.add_handler(CommandHandler("id", id_command))
+    application.add_handler(CommandHandler("ads", ads_command))
+    application.add_handler(CommandHandler("adcancel", ad_cancel_command))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(f'^{UPLOAD_BUTTON_TEXT}$'), button_handler))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(f'^{FINISH_UPLOAD_BUTTON_TEXT}$'), finish_upload_handler))
     application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.Document.ALL & ~filters.ChatType.CHANNEL, file_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
     application.add_handler(CallbackQueryHandler(button_callback_handler))
+    application.add_error_handler(error_handler)
     
     logger.info(">>> 机器人正在启动... <<<")
     
