@@ -14,15 +14,16 @@ from psycopg2 import pool
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ChatMemberStatus, ChatType
-from telegram.error import TimedOut, BadRequest, NetworkError
+from telegram.error import TimedOut, BadRequest, Forbidden, NetworkError, RetryAfter
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     ContextTypes,
     CommandHandler,
     MessageHandler,
     filters,
     CallbackQueryHandler,
-    Defaults
+    TypeHandler,
 )
 from telegram.request import HTTPXRequest
 
@@ -78,7 +79,7 @@ if DATABASE_URL and 'sslmode' not in DATABASE_URL and 'localhost' not in DATABAS
     else:
         DATABASE_URL += '?sslmode=require'
 
-db_pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
+db_pool: Optional[pool.ThreadedConnectionPool] = None
 
 
 def validate_config() -> None:
@@ -98,7 +99,7 @@ def init_database_pool() -> None:
     global db_pool
     try:
         # execute_db 会在线程池中运行，必须使用线程安全的连接池。
-        db_pool = psycopg2.pool.ThreadedConnectionPool(
+        db_pool = pool.ThreadedConnectionPool(
             1, 20,
             dsn=DATABASE_URL,
             connect_timeout=10,
@@ -165,6 +166,36 @@ def setup_database():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                is_blocked BOOLEAN NOT NULL DEFAULT FALSE,
+                first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS broadcasts (
+                id BIGSERIAL PRIMARY KEY,
+                admin_id BIGINT NOT NULL,
+                source_chat_id BIGINT NOT NULL,
+                source_message_id BIGINT NOT NULL,
+                total_count INTEGER NOT NULL DEFAULT 0,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                blocked_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                status VARCHAR(20) NOT NULL DEFAULT 'running',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                finished_at TIMESTAMPTZ
+            )
+        ''')
+        cursor.execute('''
+            INSERT INTO bot_users (user_id)
+            SELECT DISTINCT uploader_id FROM files
+            ON CONFLICT (user_id) DO NOTHING
+        ''')
         for slot in AD_SLOTS:
             cursor.execute(
                 "INSERT INTO ad_slots (slot) VALUES (%s) ON CONFLICT (slot) DO NOTHING",
@@ -226,6 +257,30 @@ def format_ad_html(ad: Optional[Tuple[str, str, str]]) -> str:
         label = html.escape(button_text or "查看详情")
         block += f'\n<a href="{html.escape(button_url, quote=True)}">🔗 {label}</a>'
     return block
+
+
+async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """记录与机器人发生过交互的用户，供管理员全员广播使用。"""
+    user = update.effective_user
+    if not user or user.is_bot:
+        return
+    await execute_db(
+        '''
+        INSERT INTO bot_users (user_id, username, full_name)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET
+            username = EXCLUDED.username,
+            full_name = EXCLUDED.full_name,
+            is_blocked = FALSE,
+            last_seen = NOW()
+        WHERE bot_users.last_seen < NOW() - INTERVAL '1 hour'
+           OR bot_users.username IS DISTINCT FROM EXCLUDED.username
+           OR bot_users.full_name IS DISTINCT FROM EXCLUDED.full_name
+           OR bot_users.is_blocked = TRUE
+        ''',
+        (user.id, user.username, user.full_name),
+        commit=True,
+    )
 
 # --- 检查用户是否在指定群组 ---
 async def is_user_in_group(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -432,7 +487,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "为防止滥用，您必须先加入我们的官方群组才能使用机器人。"
     )
     if is_admin(update.effective_user.id):
-        help_text += "\n\n<b>管理员</b>\n▪️ 使用 /ads 管理所有广告位。\n▪️ 使用 /adcancel 取消正在进行的广告编辑。"
+        help_text += "\n\n<b>管理员</b>\n▪️ 使用 /ads 管理广告位和全员广播。\n▪️ 使用 /adcancel 取消正在进行的编辑或广播。"
     await update.message.reply_text(help_text, parse_mode="HTML")
 
 # --- /myfiles 分页 ---
@@ -507,9 +562,17 @@ async def show_ads_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         keyboard.append([InlineKeyboardButton(
             f"{status} {display_name}", callback_data=f"ad:slot:{slot}"
         )])
+    user_count = await execute_db(
+        "SELECT COUNT(*) FROM bot_users WHERE is_blocked = FALSE",
+        fetch_one=True,
+    )
+    keyboard.append([InlineKeyboardButton(
+        f"📣 全员广播（{user_count[0]} 人）", callback_data="ad:broadcast"
+    )])
     text = (
         "📣 <b>广告位管理</b>\n\n"
-        "选择广告位进行编辑。🟢 表示已启用；没有广告文案时，即使启用也不会展示。"
+        "选择广告位进行编辑。🟢 表示已启用；没有广告文案时，即使启用也不会展示。\n\n"
+        "全员广播支持保留 Telegram 文字格式、图片、视频、文件及说明文字。"
     )
     markup = InlineKeyboardMarkup(keyboard)
     if update.callback_query:
@@ -570,6 +633,148 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text(f"你的 Telegram 用户 ID：`{update.effective_user.id}`", parse_mode="Markdown")
 
 
+async def capture_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """捕获管理员的广播原稿，并阻止它继续进入普通上传/文字处理器。"""
+    if context.user_data.get("broadcast_state") != "awaiting_message":
+        return
+    if not is_admin(update.effective_user.id if update.effective_user else None):
+        context.user_data.pop("broadcast_state", None)
+        return
+    if update.effective_chat.type != ChatType.PRIVATE or not update.effective_message:
+        return
+
+    message = update.effective_message
+    context.user_data["broadcast_draft"] = {
+        "chat_id": message.chat_id,
+        "message_id": message.message_id,
+    }
+    context.user_data["broadcast_state"] = "awaiting_confirmation"
+    await message.reply_text("👁 <b>广播预览：</b>", parse_mode="HTML")
+    try:
+        await context.bot.copy_message(
+            chat_id=message.chat_id,
+            from_chat_id=message.chat_id,
+            message_id=message.message_id,
+        )
+    except BadRequest as e:
+        context.user_data.pop("broadcast_draft", None)
+        context.user_data["broadcast_state"] = "awaiting_message"
+        await message.reply_text(f"❌ 这类消息暂不支持广播：{html.escape(str(e))}", parse_mode="HTML")
+        raise ApplicationHandlerStop
+
+    target_count = await execute_db(
+        "SELECT COUNT(*) FROM bot_users WHERE is_blocked = FALSE",
+        fetch_one=True,
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ 确认发送", callback_data="ad:broadcast_confirm"),
+        InlineKeyboardButton("❌ 取消", callback_data="ad:broadcast_cancel"),
+    ]])
+    await message.reply_text(
+        f"确认向 <b>{target_count[0]}</b> 位用户发送以上消息吗？\n\n发送后无法撤回。",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+    raise ApplicationHandlerStop
+
+
+async def run_broadcast(
+    context: ContextTypes.DEFAULT_TYPE,
+    broadcast_id: int,
+    source_chat_id: int,
+    source_message_id: int,
+    status_chat_id: int,
+    status_message_id: int,
+) -> None:
+    rows = await execute_db(
+        "SELECT user_id FROM bot_users WHERE is_blocked = FALSE ORDER BY user_id",
+        fetch_all=True,
+    )
+    user_ids = [row[0] for row in rows]
+    success = blocked = failed = 0
+    blocked_ids = []
+
+    for index, user_id in enumerate(user_ids, start=1):
+        try:
+            await context.bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=source_chat_id,
+                message_id=source_message_id,
+            )
+            success += 1
+        except RetryAfter as e:
+            delay = e.retry_after.total_seconds() if hasattr(e.retry_after, "total_seconds") else float(e.retry_after)
+            await asyncio.sleep(delay + 0.5)
+            try:
+                await context.bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=source_chat_id,
+                    message_id=source_message_id,
+                )
+                success += 1
+            except (Forbidden, BadRequest):
+                blocked += 1
+                blocked_ids.append(user_id)
+            except Exception:
+                failed += 1
+        except (Forbidden, BadRequest):
+            blocked += 1
+            blocked_ids.append(user_id)
+        except (TimedOut, NetworkError):
+            failed += 1
+        except Exception as e:
+            logger.warning("广播发送给用户 %s 失败: %s", user_id, e)
+            failed += 1
+
+        # 控制在 Telegram 群发速率以内，并定期更新进度。
+        await asyncio.sleep(0.045)
+        if index % 100 == 0:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=status_chat_id,
+                    message_id=status_message_id,
+                    text=(
+                        f"📣 <b>正在广播…</b>\n\n"
+                        f"进度：{index}/{len(user_ids)}\n"
+                        f"成功：{success}　不可达：{blocked}　失败：{failed}"
+                    ),
+                    parse_mode="HTML",
+                )
+            except BadRequest:
+                pass
+
+    if blocked_ids:
+        await execute_db(
+            "UPDATE bot_users SET is_blocked = TRUE WHERE user_id = ANY(%s)",
+            (blocked_ids,),
+            commit=True,
+        )
+    await execute_db(
+        '''
+        UPDATE broadcasts SET total_count = %s, success_count = %s,
+            blocked_count = %s, failed_count = %s, status = 'completed', finished_at = NOW()
+        WHERE id = %s
+        ''',
+        (len(user_ids), success, blocked, failed, broadcast_id),
+        commit=True,
+    )
+    try:
+        await context.bot.edit_message_text(
+            chat_id=status_chat_id,
+            message_id=status_message_id,
+            text=(
+                "✅ <b>广播完成</b>\n\n"
+                f"目标：{len(user_ids)}\n"
+                f"成功：{success}\n"
+                f"不可达：{blocked}\n"
+                f"其他失败：{failed}"
+            ),
+            parse_mode="HTML",
+        )
+    except BadRequest:
+        pass
+
+
 async def handle_ad_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, parts: List[str]) -> bool:
     if not parts or parts[0] != "ad":
         return False
@@ -586,9 +791,62 @@ async def handle_ad_callback(update: Update, context: ContextTypes.DEFAULT_TYPE,
     slot = parts[2] if len(parts) > 2 else ""
     if action == "list":
         context.user_data.pop("ad_edit", None)
+        context.user_data.pop("broadcast_state", None)
+        context.user_data.pop("broadcast_draft", None)
         await show_ads_panel(update, context)
+    elif action == "broadcast":
+        context.user_data.pop("ad_edit", None)
+        context.user_data.pop("broadcast_draft", None)
+        context.user_data["broadcast_state"] = "awaiting_message"
+        await query.message.reply_text(
+            "📣 <b>请发送要广播的消息</b>\n\n"
+            "你可以先在 Telegram 输入框中设置粗体、斜体、链接等格式，也可以发送图片、视频或文件并填写说明文字。\n\n"
+            "机器人会先显示预览，不会立即群发。发送 /adcancel 可取消。",
+            parse_mode="HTML",
+        )
+    elif action == "broadcast_cancel":
+        context.user_data.pop("broadcast_state", None)
+        context.user_data.pop("broadcast_draft", None)
+        await query.edit_message_text("✅ 已取消广播。")
+    elif action == "broadcast_confirm":
+        draft = context.user_data.get("broadcast_draft")
+        if context.user_data.get("broadcast_state") != "awaiting_confirmation" or not draft:
+            await query.edit_message_text("⚠️ 广播原稿已失效，请返回 /ads 重新操作。")
+            return True
+        target_count = await execute_db(
+            "SELECT COUNT(*) FROM bot_users WHERE is_blocked = FALSE",
+            fetch_one=True,
+        )
+        log_row = await execute_db(
+            '''
+            INSERT INTO broadcasts (admin_id, source_chat_id, source_message_id, total_count)
+            VALUES (%s, %s, %s, %s) RETURNING id
+            ''',
+            (query.from_user.id, draft["chat_id"], draft["message_id"], target_count[0]),
+            fetch_one=True,
+            commit=True,
+        )
+        await query.edit_message_text(
+            f"📣 <b>正在广播…</b>\n\n进度：0/{target_count[0]}",
+            parse_mode="HTML",
+        )
+        status_message = query.message
+        context.application.create_task(
+            run_broadcast(
+                context,
+                log_row[0],
+                draft["chat_id"],
+                draft["message_id"],
+                status_message.chat_id,
+                status_message.message_id,
+            ),
+            update=update,
+            name=f"broadcast-{log_row[0]}",
+        )
+        context.user_data.pop("broadcast_state", None)
+        context.user_data.pop("broadcast_draft", None)
     elif slot not in AD_SLOTS:
-        await query.answer("无效的广告位。", show_alert=True)
+        await query.message.reply_text("无效的广告位。")
     elif action == "slot":
         context.user_data.pop("ad_edit", None)
         await show_ad_slot_panel(update, context, slot)
@@ -659,6 +917,8 @@ async def ad_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not is_admin(update.effective_user.id if update.effective_user else None):
         return
     context.user_data.pop("ad_edit", None)
+    context.user_data.pop("broadcast_state", None)
+    context.user_data.pop("broadcast_draft", None)
     await update.effective_message.reply_text("已取消本次编辑。")
     await show_ads_panel(update, context)
 
@@ -973,6 +1233,11 @@ def main() -> None:
         
     application = builder.build()
 
+    application.add_handler(TypeHandler(Update, track_user), group=-2)
+    application.add_handler(
+        MessageHandler(filters.ALL & ~filters.COMMAND, capture_broadcast_message),
+        group=-1,
+    )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel_command))

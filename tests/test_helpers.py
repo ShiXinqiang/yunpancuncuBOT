@@ -28,6 +28,14 @@ class AdvertisementTests(unittest.TestCase):
     def test_empty_ad_renders_nothing(self):
         self.assertEqual(bot.format_ad_html(None), "")
 
+    def test_broadcast_callbacks_fit_telegram_limit(self):
+        callback_values = (
+            "ad:broadcast",
+            "ad:broadcast_confirm",
+            "ad:broadcast_cancel",
+        )
+        self.assertTrue(all(len(value.encode("utf-8")) <= 64 for value in callback_values))
+
 
 class PaginationTests(unittest.TestCase):
     def test_share_pagination_keeps_share_id(self):
